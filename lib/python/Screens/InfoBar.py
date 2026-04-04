@@ -306,7 +306,9 @@ class MoviePlayer(InfoBarBase, InfoBarShowHide, InfoBarLongKeyDetection, InfoBar
 		AudioSelection.fillSubtitleExt = self.subtitleListInject
 		if self.onAudioSubTrackChanged not in AudioSelection.hooks:
 			AudioSelection.hooks.append(self.onAudioSubTrackChanged)
-		self.__evServiceStartInit()
+		self.__event_tracker = ServiceEventTracker(screen=self, eventmap={
+			enigma.iPlayableService.evStart: self.__evServiceStartInit})
+		self.__evServiceStartInit() # initially load subtitles since sometimes event is missed.
 		config.misc.standbyCounter.addNotifier(self.standbyCountChanged, initial_call=False)
 
 		if type(self) is MoviePlayer:
