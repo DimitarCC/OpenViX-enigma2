@@ -22,6 +22,17 @@ Licensed under GPLv2.
 #error "no BYTE_ORDER defined!"
 #endif
 
+#ifdef HAVE_EGL
+// Defined in lib/gdi/egl/gtexture_manager.cpp - queues a GLES texture name
+// for deletion on gRC's render thread (glDeleteTextures() needs a current
+// EGL context, which only that thread has). gSurface's destructor below is
+// the one place that reliably runs exactly when a surface (and whatever
+// texture gTextureManager may have cached for it - see gUnmanagedSurface's
+// gl_texture_id) is no longer needed by anything, regardless of which
+// specific code path let its last reference go.
+extern "C" void egl_queue_texture_deletion(unsigned int gl_texture_id);
+#endif
+
 /* surface acceleration threshold: do not attempt to accelerate surfaces smaller than the threshold (measured in bytes) */
 #ifndef GFX_SURFACE_ACCELERATION_THRESHOLD
 #define GFX_SURFACE_ACCELERATION_THRESHOLD 48000
@@ -233,6 +244,31 @@ gSurface::gSurface(int width, int height, int _bpp, int accel):
 
 gSurface::~gSurface()
 {
+	// gTextureManager::getTexture() (lib/gdi/egl/gtexture_manager.cpp)
+	// caches a GLES texture name here the first time this surface is
+	// blitted through the EGL backend, to avoid re-uploading it on every
+	// draw - but nothing ever released that texture once this surface
+	// (and its cached name) went away: egl_queue_texture_deletion() was
+	// defined but never called anywhere, an unconditional leak of one GL
+	// texture (and, for an accel-backed surface uploaded via
+	// createTextureFromDmabuf()'s DMA-BUF import path, of the underlying
+	// EGLImageKHR pinning that region of the accel pool / system ION heap
+	// at the driver level) per surface that ever got textured. That
+	// matches "ION exhausts gradually as more and more distinct images get
+	// rendered, independent of scroll speed" exactly: every picon/icon
+	// that's ever been shown once leaks its accel-backed memory forever
+	// instead of returning it when scrolled away and destroyed.
+#ifdef HAVE_EGL
+	// Diagnostic only: gTextureManager's own logs (+texture/-texture) never
+	// show a single deletion across an entire long-running session despite
+	// plenty of surfaces provably going out of scope Python-side - this
+	// traces whether that's because ~gSurface() itself isn't running for
+	// them (something else is still keeping the gPixmap referenced) or
+	// because it runs but gl_texture_id is unexpectedly 0 here.
+	eDebug("[gSurface] dtor surface=%p gl_texture_id=%u %dx%d bpp=%d", this, gl_texture_id, x, y, bpp);
+	if (gl_texture_id)
+		egl_queue_texture_deletion(gl_texture_id);
+#endif
 	gAccel::getInstance()->accelFree(this);
 	if (data)
 	{
