@@ -4122,25 +4122,16 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 						 * there is no clock wait left to offset, so it's dropped. */
 						g_object_set (G_OBJECT (subsink), "sync", FALSE, NULL);
 						g_object_set (G_OBJECT (subsink), "async", TRUE, NULL);
-						/* Historical fix (commit b9c0b3c8ec, 2010, on the old
-						 * plain-appsink-based subtitle sink) for the same
-						 * class of embedded-MKV-subtitle hang also capped
-						 * the sink's own buffer queue (max-buffers=2) rather
-						 * than leaving it unbounded - untested whether
-						 * "subsink" (gst-plugins-bad's purpose-built element,
-						 * different from that old appsink) even exposes
-						 * these properties, hence the readback checks below,
-						 * same pattern as the "async" check above. */
-						g_object_set (G_OBJECT (subsink), "max-buffers", 2, NULL);
-						g_object_set (G_OBJECT (subsink), "drop", TRUE, NULL);
-						{
-							guint max_buffers_readback = 0;
-							gboolean drop_readback = FALSE;
-							g_object_get(G_OBJECT(subsink), "max-buffers", &max_buffers_readback, NULL);
-							g_object_get(G_OBJECT(subsink), "drop", &drop_readback, NULL);
-							eDebug("[eServiceMP3] subsink max-buffers readback: %u, drop readback: %s",
-								max_buffers_readback, drop_readback ? "TRUE" : "FALSE");
-						}
+						/* Historical fix (commit b9c0b3c8ec, 2010) for the same
+						 * class of embedded-MKV-subtitle hang, on the old
+						 * plain-appsink-based subtitle sink, also capped that
+						 * sink's own buffer queue (max-buffers=2). Confirmed
+						 * on-device NOT applicable here: "subsink" is
+						 * GstSubSink (gst-plugins-bad's purpose-built element,
+						 * unrelated to GstAppSink) and has neither a
+						 * "max-buffers" nor a "drop" property at all - GLib
+						 * logs a CRITICAL for each g_object_set/get attempt
+						 * above and both silently no-op. */
 						eDebug("[eServiceMP3] subsink properties set!");
 						gst_object_unref(subsink);
 					}
@@ -5099,6 +5090,73 @@ void eServiceMP3::playbinNotifySource(GObject *object, GParamSpec *unused, gpoin
 	}
 }
 
+static void disableInputSelectorSyncStreams(GstElement *element, const gchar *elementname)
+{
+	/* playbin creates its own internal GstInputSelector to arbitrate
+	 * between multiple text (subtitle) pads when a stream has more
+	 * than one - a file with two embedded SRT/ASS tracks fires this
+	 * for the text selector. With sync-streams (default TRUE),
+	 * selecting/seeking requires every input pad - not just the
+	 * active one - to stay roughly time-synchronized; a sparse,
+	 * currently-UNSELECTED subtitle pad that can't keep up can then
+	 * stall a flushing seek on the whole pipeline even though
+	 * subsink (the currently-active pad's sink) is never itself
+	 * blocked - this is a different mechanism than the sync=FALSE/
+	 * async=TRUE mitigations on subsink, which only affect the
+	 * active pad's own sink. Disabling sync-streams only affects
+	 * how the INACTIVE pad is kept in step for a seamless later
+	 * switch - it does not touch the timing of buffers from
+	 * whichever pad is currently selected, which pullSubtitle()/
+	 * pushSubtitles() already time from the buffer's own PTS
+	 * regardless. */
+	g_object_set(G_OBJECT(element), "sync-streams", FALSE, NULL);
+	gboolean sync_streams_readback = TRUE;
+	g_object_get(G_OBJECT(element), "sync-streams", &sync_streams_readback, NULL);
+	eDebug("[eServiceMP3] %s sync-streams property readback: %s", elementname, sync_streams_readback ? "TRUE" : "FALSE");
+}
+
+void eServiceMP3::disableAllInputSelectorSyncStreams()
+{
+	/* handleElementAdded()'s "input-selector" handling below only fires if
+	 * playbin creates this element as a direct child of a bin we already
+	 * listen on "element-added" for - it may instead be nested inside some
+	 * other internal playbin sub-bin we never hook. Actively searching the
+	 * whole pipeline recursively (same pattern as the GstDVBAudioSink/
+	 * GstDVBVideoSink lookup in gstBusCall()'s READY_TO_PAUSED handling)
+	 * finds it regardless of nesting, so this is called from
+	 * enableSubtitles() - right when we know current-text selection just
+	 * happened and any text input-selector must already exist - as a more
+	 * reliable fallback/supplement to the signal-based hook. */
+	if (!m_gst_playbin)
+		return;
+	GstIterator *children = gst_bin_iterate_recurse(GST_BIN(m_gst_playbin));
+	GValue item = G_VALUE_INIT;
+	bool done = false;
+	while (!done)
+	{
+		switch (gst_iterator_next(children, &item))
+		{
+			case GST_ITERATOR_OK:
+			{
+				GstElement *el = GST_ELEMENT(g_value_get_object(&item));
+				if (el)
+				{
+					gchar *name = gst_element_get_name(el);
+					if (g_str_has_prefix(name, "input-selector"))
+						disableInputSelectorSyncStreams(el, name);
+					g_free(name);
+				}
+				g_value_reset(&item);
+				break;
+			}
+			case GST_ITERATOR_RESYNC: gst_iterator_resync(children); break;
+			default: done = true; break;
+		}
+	}
+	g_value_unset(&item);
+	gst_iterator_free(children);
+}
+
 void eServiceMP3::handleElementAdded(GstBin *bin, GstElement *element, gpointer user_data)
 {
 	eServiceMP3 *_this = (eServiceMP3*)user_data;
@@ -5128,29 +5186,7 @@ void eServiceMP3::handleElementAdded(GstBin *bin, GstElement *element, gpointer 
 		}
 		else if (g_str_has_prefix(elementname, "input-selector"))
 		{
-			/* playbin creates its own internal GstInputSelector to arbitrate
-			 * between multiple text (subtitle) pads when a stream has more
-			 * than one - this file has two embedded SRT/ASS tracks, so this
-			 * fires for the text selector. With sync-streams (default TRUE),
-			 * selecting/seeking requires every input pad - not just the
-			 * active one - to stay roughly time-synchronized; a sparse,
-			 * currently-UNSELECTED subtitle pad that can't keep up can then
-			 * stall a flushing seek on the whole pipeline even though
-			 * subsink (the currently-active pad's sink) is never itself
-			 * blocked - this is a different mechanism than the sync=FALSE/
-			 * async=TRUE mitigations on subsink, which only affect the
-			 * active pad's own sink. Disabling sync-streams only affects
-			 * how the INACTIVE pad is kept in step for a seamless later
-			 * switch - it does not touch the timing of buffers from
-			 * whichever pad is currently selected, which pullSubtitle()/
-			 * pushSubtitles() already time from the buffer's own PTS
-			 * regardless. */
-			g_object_set(G_OBJECT(element), "sync-streams", FALSE, NULL);
-			{
-				gboolean sync_streams_readback = TRUE;
-				g_object_get(G_OBJECT(element), "sync-streams", &sync_streams_readback, NULL);
-				eDebug("[eServiceMP3] %s sync-streams property readback: %s", elementname, sync_streams_readback ? "TRUE" : "FALSE");
-			}
+			disableInputSelectorSyncStreams(element, elementname);
 		}
 		g_free(elementname);
 	}
@@ -5539,6 +5575,14 @@ RESULT eServiceMP3::enableSubtitles(iSubtitleUser *user, struct SubtitleTrack &t
 
 	if (track.type != stDVB)
 	{
+		/* Do this before clearBuffers()'s flush below: the text
+		 * input-selector playbin creates internally for this stream must
+		 * already exist by now (current-text selection just happened
+		 * above), and disabling its sync-streams property needs to happen
+		 * before the flush it could otherwise stall - see
+		 * disableAllInputSelectorSyncStreams()'s own comment. */
+		disableAllInputSelectorSyncStreams();
+
 		/* The switch above alone does not make the new track actually
 		 * render until the pipeline flushes - without this, video/audio
 		 * keep playing but the new subtitle track never shows anything
