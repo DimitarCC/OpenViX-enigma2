@@ -5506,37 +5506,6 @@ RESULT eServiceMP3::enableSubtitles(iSubtitleUser *user, struct SubtitleTrack &t
 		return -1;
 	}
 	eDebug ("[eServiceMP3][enableSubtitles] entered: subtitle stream %i track.pid %i", m_currentSubtitleStream, track.pid - 1);
-
-	if (track.type != stDVB)
-	{
-		/* Workaround: on-device testing found that a flushing seek right
-		 * after selecting an embedded (non-DVB) subtitle track reliably
-		 * hangs the pipeline (see clearBuffers() below) - but ONLY the
-		 * first time this happens in a session. If the current audio track
-		 * is force-reselected (itself going through the same kind of
-		 * pipeline reconfiguration/flush) before ever touching subtitles,
-		 * later subtitle-triggered seeks - including plain manual seeks,
-		 * not just this one - stop hanging entirely. The actual mechanism
-		 * isn't understood (no on-device GDB/GST_DEBUG access to confirm
-		 * what specifically gets "unstuck"), but forcing that reselect
-		 * here, unconditionally, reproduces the same effect without
-		 * requiring the user to manually switch audio tracks first. Cheap
-		 * and harmless if it turns out unnecessary on some files/setups.
-		 *
-		 * Must happen before the current-text writes below (not just before
-		 * the subtitle clearBuffers() flush): on-device testing found that
-		 * order matters, not just doing the reselect somewhere beforehand.
-		 * Goes through selectTrack() - the same entry point the audio
-		 * selection screen itself uses - rather than a stripped-down
-		 * reselect, so this is a real, forced re-selection of the current
-		 * track (full side effects: evUpdatedInfo, its own clearBuffers(),
-		 * passthrough/cache handling), not just a bare current-audio
-		 * property write. */
-		int current_audio = getCurrentTrack();
-		if (current_audio >= 0 && current_audio < getNumberOfTracks())
-			selectTrack(current_audio);
-	}
-
 	g_object_set (G_OBJECT (m_gst_playbin), "current-text", -1, NULL);
 	m_subtitle_sync_timer->stop();
 	m_dvb_subtitle_sync_timer->stop();
