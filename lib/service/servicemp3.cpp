@@ -4122,6 +4122,25 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 						 * there is no clock wait left to offset, so it's dropped. */
 						g_object_set (G_OBJECT (subsink), "sync", FALSE, NULL);
 						g_object_set (G_OBJECT (subsink), "async", TRUE, NULL);
+						/* Historical fix (commit b9c0b3c8ec, 2010, on the old
+						 * plain-appsink-based subtitle sink) for the same
+						 * class of embedded-MKV-subtitle hang also capped
+						 * the sink's own buffer queue (max-buffers=2) rather
+						 * than leaving it unbounded - untested whether
+						 * "subsink" (gst-plugins-bad's purpose-built element,
+						 * different from that old appsink) even exposes
+						 * these properties, hence the readback checks below,
+						 * same pattern as the "async" check above. */
+						g_object_set (G_OBJECT (subsink), "max-buffers", 2, NULL);
+						g_object_set (G_OBJECT (subsink), "drop", TRUE, NULL);
+						{
+							guint max_buffers_readback = 0;
+							gboolean drop_readback = FALSE;
+							g_object_get(G_OBJECT(subsink), "max-buffers", &max_buffers_readback, NULL);
+							g_object_get(G_OBJECT(subsink), "drop", &drop_readback, NULL);
+							eDebug("[eServiceMP3] subsink max-buffers readback: %u, drop readback: %s",
+								max_buffers_readback, drop_readback ? "TRUE" : "FALSE");
+						}
 						eDebug("[eServiceMP3] subsink properties set!");
 						gst_object_unref(subsink);
 					}
