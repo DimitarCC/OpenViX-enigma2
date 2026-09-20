@@ -1630,15 +1630,8 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 	m_position_baseline_valid = false;
 	m_position_correction_enabled = true;
 	m_position_baseline = 0;
-	m_position_baseline_stable_count = 0;
-	m_position_baseline_prev_raw = -1;
-	g_mutex_init(&m_pts_position_mutex);
-	m_last_audio_pts_ns = GST_CLOCK_TIME_NONE;
-	m_last_video_pts_ns = GST_CLOCK_TIME_NONE;
-	m_pts_audio_pad = NULL;
-	m_pts_video_pad = NULL;
-	m_pts_audio_probe_id = 0;
-	m_pts_video_probe_id = 0;
+	m_position_baseline_provisional = -1;
+	m_position_baseline_first_seen_us = 0;
 	m_errorInfo.missing_codec = "";
 	audioSink = videoSink = NULL;
 	m_decoder = NULL;
@@ -1960,15 +1953,6 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 
 eServiceMP3::~eServiceMP3()
 {
-	/* Must happen before stop() hands the actual GST_STATE_NULL teardown off
-	 * to its worker thread (see stopWorker()'s comment) - once that worker
-	 * is running, the pipeline (and any pad ptsProbeCallback() reads from)
-	 * can keep delivering buffers into "this" for a while after this
-	 * destructor itself has finished, since the two are no longer
-	 * synchronized. Removing the probes here, synchronously, guarantees
-	 * ptsProbeCallback() can never fire into an already-freed "this". */
-	detachPTSProbes();
-
 	// disconnect subtitle callback
 	GstElement *subsink = gst_bin_get_by_name(GST_BIN(m_gst_playbin), "subtitle_sink");
 
@@ -2387,8 +2371,8 @@ RESULT eServiceMP3::stop()
 	 * startup correction for the next start() same as a fresh instance. */
 	m_position_baseline_valid = false;
 	m_position_correction_enabled = true;
-	m_position_baseline_stable_count = 0;
-	m_position_baseline_prev_raw = -1;
+	m_position_baseline_provisional = -1;
+	m_position_baseline_first_seen_us = 0;
 	if (!m_gst_playbin || m_state == stStopped || !m_ref)
 		return -1;
 
@@ -2406,15 +2390,6 @@ RESULT eServiceMP3::stop()
 
 	stopHDAudioAuxPipeline(m_gst_playbin, false);
 	disconnectAsyncSignalHandlers();
-
-	/* Same reasoning as disconnectAsyncSignalHandlers()/the HDR probe
-	 * removal further below: once GST_STATE_NULL runs on stopWorker()'s
-	 * thread, this object can be destroyed (or restarted via start())
-	 * before that teardown actually completes, and ptsProbeCallback()
-	 * firing into a freed/reused "this" would be exactly the same class of
-	 * bug those exist to prevent. Remove synchronously, here, before
-	 * anything else. */
-	detachPTSProbes();
 
 	/* See stopWorker()'s comment: hand the actual (potentially blocking)
 	 * teardown off to a worker thread instead of doing it here, plus a
@@ -2549,8 +2524,27 @@ RESULT eServiceMP3::seekToImpl(pts_t to)
 	 * position correctly (this is what makes a manual seek "fix" the
 	 * display today), so getPlayPosition()'s one-time startup correction is
 	 * no longer needed - permanently disable it rather than recomputing a
-	 * new baseline, so it never touches an already-correct reading again. */
-	m_position_correction_enabled = false;
+	 * new baseline, so it never touches an already-correct reading again.
+	 *
+	 * But only if that startup correction had actually finished capturing a
+	 * baseline by the time this seek happened - otherwise there was nothing
+	 * working to replace: an automatic seek can happen very early (e.g. an
+	 * auto/forced "resume playback" seek firing ~1s after start, before the
+	 * confirm window above has necessarily elapsed), and disabling
+	 * correction here unconditionally would leave getPlayPosition()
+	 * permanently returning the raw, uncorrected reading for the rest of
+	 * the session - silently reintroducing the exact bug this correction
+	 * exists to fix, with no further seek left to "fix the display" the way
+	 * the comment above describes for the normal case. In that situation,
+	 * leave correction enabled and let it capture its baseline from
+	 * whatever raw readings come after this seek instead - discard any
+	 * in-progress (pre-seek) candidate first, since the position just
+	 * jumped and that candidate is no longer a reading of the same
+	 * starting point. */
+	if (m_position_baseline_valid)
+		m_position_correction_enabled = false;
+	else
+		m_position_baseline_provisional = -1;
 
 	if (getHDAudioAuxState(m_gst_playbin))
 		seekHDAudioAuxPersistent(m_gst_playbin, m_last_seek_pos);
@@ -2811,13 +2805,41 @@ RESULT eServiceMP3::getRawPlayPosition(pts_t &pts)
  * which get-decoder-time/gst_element_query_position() may return a
  * transient, unrepresentative value (e.g. stuck at 0, or some other
  * not-yet-locked reading) before the decoder clock genuinely starts
- * advancing - latching onto one of those would bake in a wrong baseline
- * for the rest of this correction's lifetime. So, mirroring
- * pushSubtitles()'s own "wait until clock is stable" guard, this instead
- * waits to see the raw reading actually ADVANCE across several consecutive
- * calls before trusting it, only then capturing it as the baseline. Until
- * stabilised, this reports 0 rather than a baseline computed from an
- * unstable reading.
+ * advancing, or may briefly jitter backwards before it locks - latching
+ * onto one of those would bake in a wrong baseline for the rest of this
+ * correction's lifetime. So this waits to see the raw reading hold (not go
+ * backwards) across a short real-time window before trusting it, only then
+ * capturing it as the baseline. Until confirmed, this reports 0 rather than
+ * a baseline computed from an unconfirmed reading.
+ *
+ * The candidate for that baseline is not necessarily first captured here
+ * either: gstBusCall()'s GST_STATE_CHANGE_PAUSED_TO_PLAYING handling seeds
+ * it as soon as the pipeline first reaches PLAYING, rather than leaving the
+ * very first sample to whichever Python UI timer happens to call
+ * getPlayPosition() first. A network/HLS source in particular can sit
+ * PAUSED filling its prefill buffer for a few real seconds before that
+ * transition fires (see the GST_MESSAGE_BUFFERING handling further down),
+ * during which the decoder can already race ahead of real-time on the
+ * queued data - if nothing polled position until after that point, the
+ * first call here would otherwise mistake that already-elapsed offset for
+ * "time zero" and the display would visibly start several seconds in. This
+ * function still seeds its own candidate the same way on its own first
+ * call, as a fallback for any service type/path that does not go through
+ * that state-change handling.
+ *
+ * That confirmation window is real wall-clock time (g_get_monotonic_time()),
+ * not a number of getPlayPosition() calls: this is polled independently by
+ * several UI timers (position display, subtitle renderer, timeshift, ...)
+ * all sharing this same state, so a call-count gate's real-time cost is
+ * unpredictable - depending on how those pollers happen to interleave, or
+ * how coarsely the underlying decoder-time/position query updates, it can
+ * end up spanning several real seconds. Every one of those seconds would
+ * then be baked into m_position_baseline as a permanent offset - visibly,
+ * playback appearing to "start" several seconds in rather than at 0. Using
+ * a small, fixed real-time bound avoids that regardless of polling pattern.
+ * The baseline itself is the reading from when the candidate was first
+ * seen, not from when confirmation completed a short time later, so the
+ * (bounded, small) confirmation delay itself is not baked in either.
  *
  * getRawPlayPosition() itself is left untouched - trickSeek()/
  * seekRelative()/clearBuffers() depend on its value being in the same
@@ -2838,149 +2860,38 @@ RESULT eServiceMP3::getPlayPosition(pts_t &pts)
 
 	if (!m_position_baseline_valid)
 	{
-		/* Count consecutive calls where the raw reading has not gone
-		 * backwards from the previous one; a drop (still buffering/
-		 * prerolling, a genuinely stuck-then-reset clock, or a noisy/
-		 * non-monotonic reading bouncing between values while prerolling)
-		 * resets the count. Deliberately >= rather than a plain "!=" check:
-		 * get-decoder-time/gst_element_query_position() can jitter
-		 * non-monotonically before the decoder clock genuinely locks (e.g.
-		 * 0, 5, 0, 3, ...), and unlike pushSubtitles()'s per-call use of its
-		 * own stability guard (which just gates whether to trust *that
-		 * call's* reading, recomputed fresh every time), a bad reading
-		 * captured here becomes a permanent baseline for the rest of the
-		 * session - so a value merely differing from the last one is not
-		 * enough evidence it is trustworthy. Not strict ">" either: this is
-		 * polled independently by several UI timers (position display,
-		 * subtitle renderer, timeshift, ...), all sharing this same
-		 * counter, so two back-to-back calls legitimately landing on the
-		 * same not-yet-updated raw reading is normal and must not be
-		 * treated the same as an actual jitter-induced drop. */
-		if (raw >= m_position_baseline_prev_raw)
-			m_position_baseline_stable_count++;
-		else
-			m_position_baseline_stable_count = 0;
-		m_position_baseline_prev_raw = raw;
+		static const gint64 confirm_window_us = 300 * 1000; /* 300ms */
+		gint64 now = g_get_monotonic_time();
 
-		if (m_position_baseline_stable_count < 4)
+		/* No candidate yet, or the reading has gone backwards since the
+		 * candidate was captured (still prerolling, or a jittery/
+		 * not-yet-locked clock) - (re)start the candidate from this
+		 * reading, timestamped now. */
+		if (m_position_baseline_provisional < 0 || raw < m_position_baseline_provisional)
+		{
+			m_position_baseline_provisional = raw;
+			m_position_baseline_first_seen_us = now;
+			pts = 0;
+			return 0;
+		}
+
+		if (now - m_position_baseline_first_seen_us < confirm_window_us)
 		{
 			pts = 0;
 			return 0;
 		}
 
-		/* Stabilised: the clock has been observed advancing on every one of
-		 * the last several calls, so this reading is trustworthy. Captures
-		 * "raw" as-is (the reading at the moment stabilisation was
-		 * confirmed, not the one from a few calls earlier when it started)
-		 * - the small amount of real playback time spent confirming
-		 * stability becomes a correspondingly small, one-time baseline
-		 * offset, not worth a rolling window to eliminate. */
-		m_position_baseline = raw;
+		/* Confirmed: the reading has not gone backwards for a real
+		 * confirm_window_us stretch, so it is trustworthy. Use the
+		 * candidate as first captured, not "raw" here - the time spent
+		 * confirming must not itself become part of the baseline. */
+		m_position_baseline = m_position_baseline_provisional;
 		m_position_baseline_valid = true;
 	}
 
 	pts = raw - m_position_baseline;
 	if (pts < 0)
 		pts = 0;
-	return 0;
-}
-
-GstPadProbeReturn eServiceMP3::ptsProbeCallback(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
-{
-	eServiceMP3 *_this = (eServiceMP3*)user_data;
-	GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
-	if (!buffer)
-		return GST_PAD_PROBE_OK;
-
-	guint64 pts = GST_BUFFER_PTS(buffer);
-	if (!GST_CLOCK_TIME_IS_VALID(pts))
-		return GST_PAD_PROBE_OK;
-
-	g_mutex_lock(&_this->m_pts_position_mutex);
-	if (pad == _this->m_pts_audio_pad)
-		_this->m_last_audio_pts_ns = pts;
-	else if (pad == _this->m_pts_video_pad)
-		_this->m_last_video_pts_ns = pts;
-	g_mutex_unlock(&_this->m_pts_position_mutex);
-
-	return GST_PAD_PROBE_OK;
-}
-
-void eServiceMP3::attachPTSProbes()
-{
-	/* Re-resolve every time this runs (READY_TO_PAUSED, alongside
-	 * audioSink/videoSink themselves being re-resolved) rather than only
-	 * once: audioSink/videoSink can be replaced across a pipeline restart,
-	 * and a stale pad reference here would silently stop updating. */
-	detachPTSProbes();
-
-	if (audioSink)
-	{
-		GstPad *pad = gst_element_get_static_pad(audioSink, "sink");
-		if (pad)
-		{
-			m_pts_audio_pad = pad; /* takes the ref from get_static_pad */
-			m_pts_audio_probe_id = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
-				ptsProbeCallback, this, NULL);
-		}
-	}
-	if (videoSink)
-	{
-		GstPad *pad = gst_element_get_static_pad(videoSink, "sink");
-		if (pad)
-		{
-			m_pts_video_pad = pad;
-			m_pts_video_probe_id = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
-				ptsProbeCallback, this, NULL);
-		}
-	}
-}
-
-void eServiceMP3::detachPTSProbes()
-{
-	if (m_pts_audio_pad)
-	{
-		if (m_pts_audio_probe_id)
-			gst_pad_remove_probe(m_pts_audio_pad, m_pts_audio_probe_id);
-		gst_object_unref(m_pts_audio_pad);
-		m_pts_audio_pad = NULL;
-		m_pts_audio_probe_id = 0;
-	}
-	if (m_pts_video_pad)
-	{
-		if (m_pts_video_probe_id)
-			gst_pad_remove_probe(m_pts_video_pad, m_pts_video_probe_id);
-		gst_object_unref(m_pts_video_pad);
-		m_pts_video_pad = NULL;
-		m_pts_video_probe_id = 0;
-	}
-	g_mutex_lock(&m_pts_position_mutex);
-	m_last_audio_pts_ns = GST_CLOCK_TIME_NONE;
-	m_last_video_pts_ns = GST_CLOCK_TIME_NONE;
-	g_mutex_unlock(&m_pts_position_mutex);
-}
-
-/* Position derived directly from the last decoded buffer's own
- * GST_BUFFER_PTS (read via ptsProbeCallback() on the audio/video sink
- * pads) - the same mechanism pullSubtitle() already uses for subtitle
- * buffers, applied here for a general playback position instead of
- * getRawPlayPosition()'s hardware decoder-time register / pipeline
- * position query. Prefers audio's PTS over video's, same preference
- * getRawPlayPosition() already has, for consistency between the two. */
-RESULT eServiceMP3::getPTSPlayPosition(pts_t &pts)
-{
-	pts = 0;
-
-	g_mutex_lock(&m_pts_position_mutex);
-	guint64 pts_ns = GST_CLOCK_TIME_IS_VALID(m_last_audio_pts_ns) ?
-		m_last_audio_pts_ns : m_last_video_pts_ns;
-	g_mutex_unlock(&m_pts_position_mutex);
-
-	if (!GST_CLOCK_TIME_IS_VALID(pts_ns))
-		return -1;
-
-	/* pts_ns is in nanoseconds. we have 90 000 pts per second. */
-	pts = pts_ns / 11111LL;
 	return 0;
 }
 
@@ -4297,16 +4208,6 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 						eDebug("[eServiceMP3] subsink properties set!");
 						gst_object_unref(subsink);
 					}
-					/* Must happen before audioSink/videoSink themselves are
-					 * unreffed just below: detachPTSProbes() removes the
-					 * probe from their current sink pads, which requires
-					 * those pads (and the elements owning them) to still be
-					 * valid. attachPTSProbes() (further down) re-adds probes
-					 * on whatever audioSink/videoSink are resolved to this
-					 * time, so this is a full detach-then-reattach cycle
-					 * across every pipeline (re)start, same as audioSink/
-					 * videoSink's own re-resolution here. */
-					detachPTSProbes();
 					if (audioSink)
 					{
 						gst_object_unref(GST_OBJECT(audioSink));
@@ -4331,8 +4232,6 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 						g_value_unset(&result);
 					}
 					gst_iterator_free(children);
-
-					attachPTSProbes();
 
 					/* if we are in preroll already do not check again the state */
 					if (!m_is_live)
@@ -4422,6 +4321,29 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 					m_clear_buffers = false;
 					if (!m_initial_start)
 					{
+						/* Seed the startup position-baseline candidate right here,
+						 * at the exact moment the pipeline first reaches PLAYING,
+						 * rather than leaving it to whenever some Python UI timer
+						 * happens to make its first getPlayPosition() call. On a
+						 * network/HLS source in particular, the pipeline can sit in
+						 * PAUSED filling its prefill buffer for a few real seconds
+						 * (see the GST_MESSAGE_BUFFERING handling below) before this
+						 * transition ever fires - by the time it does, the decoder
+						 * may already be several real seconds into decoding queued
+						 * data. If getPlayPosition() isn't polled again until after
+						 * that (OSD not up yet, a timer's startup delay, screen
+						 * construction order - all outside this class's control),
+						 * its first call would otherwise capture that already
+						 * elapsed offset as "time zero", and the position display
+						 * would visibly start several seconds in rather than at 0.
+						 * Sampling here instead ties the candidate to the pipeline's
+						 * own state, not to how promptly some poller reacts to it. */
+						pts_t seed_raw;
+						if (getRawPlayPosition(seed_raw) >= 0)
+						{
+							m_position_baseline_provisional = seed_raw;
+							m_position_baseline_first_seen_us = g_get_monotonic_time();
+						}
 						m_initial_start = true;
 					}
 					m_event((iPlayableService*)this, evGstreamerPlayStarted);

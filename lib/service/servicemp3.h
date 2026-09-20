@@ -177,7 +177,6 @@ public:
 	RESULT getPlayPosition(pts_t &SWIG_OUTPUT);
 	RESULT setTrickmode(int trick);
 	RESULT isCurrentlySeekable();
-	RESULT getPTSPlayPosition(pts_t &SWIG_OUTPUT);
 
 		// iServiceInformation
 	RESULT getName(std::string &name);
@@ -391,31 +390,31 @@ private:
 	 * clock has actually locked onto real playback - especially likely on
 	 * network streams, which take longer to buffer/preroll than local
 	 * files, so there is more opportunity for an early, spurious reading to
-	 * be mistaken for the real starting offset. This mirrors
-	 * pushSubtitles()'s own "wait until clock is stable" guard
-	 * (m_decoder_time_valid_state/m_prev_decoder_time) but is kept
-	 * separate: same technique, unrelated purpose, and reusing that pair
-	 * would cross-talk between the two. */
-	int m_position_baseline_stable_count;
-	pts_t m_position_baseline_prev_raw;
-
-	/* getPTSPlayPosition(): position derived directly from the last decoded
-	 * buffer's own GST_BUFFER_PTS, read via pad probes on the audio/video
-	 * sink pads - same mechanism pullSubtitle() already uses for subtitle
-	 * buffers, applied here for a general playback position instead. This
-	 * is intentionally independent of getRawPlayPosition()/getPlayPosition()
-	 * (hardware decoder-time register / pipeline position query) - a
-	 * separate, additive way to read position, not a replacement. */
-	GMutex m_pts_position_mutex;
-	guint64 m_last_audio_pts_ns; /* GST_CLOCK_TIME_NONE if none seen yet */
-	guint64 m_last_video_pts_ns;
-	GstPad *m_pts_audio_pad;
-	GstPad *m_pts_video_pad;
-	gulong m_pts_audio_probe_id;
-	gulong m_pts_video_probe_id;
-	void attachPTSProbes();
-	void detachPTSProbes();
-	static GstPadProbeReturn ptsProbeCallback(GstPad *pad, GstPadProbeInfo *info, gpointer user_data);
+	 * be mistaken for the real starting offset.
+	 *
+	 * Gated on wall-clock time (g_get_monotonic_time(), microseconds), not
+	 * a fixed number of getPlayPosition() calls: getPlayPosition() is
+	 * polled independently by several UI timers (position display,
+	 * subtitle renderer, timeshift, ...) all sharing this same state, so a
+	 * call-count gate's real-time cost is unpredictable - it can span much
+	 * longer than intended depending on how those pollers happen to
+	 * interleave, or how coarsely the underlying decoder-time/position
+	 * query updates. Since every one of those seconds is then baked in as
+	 * a permanent baseline offset (position display appearing to "start"
+	 * several seconds in), the wait itself needs a hard, small, real-time
+	 * bound instead.
+	 *
+	 * The candidate these track can be seeded from two places: getPlayPosition()
+	 * itself on its own first call, or earlier, from gstBusCall()'s
+	 * GST_STATE_CHANGE_PAUSED_TO_PLAYING handling as soon as the pipeline
+	 * first reaches PLAYING - whichever happens first. The latter matters
+	 * because getPlayPosition() may not be called by anything until well
+	 * after real playback has already started (a network/HLS source can sit
+	 * PAUSED filling its prefill buffer for a few real seconds first), and
+	 * whatever raw reading its first caller happens to see would otherwise
+	 * be mistaken for "time zero". */
+	pts_t m_position_baseline_provisional;
+	gint64 m_position_baseline_first_seen_us;
 
 	void pushDVBSubtitles();
 	void pushSubtitles();

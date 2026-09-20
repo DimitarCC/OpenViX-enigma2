@@ -561,11 +561,6 @@ public:
 	virtual RESULT isCurrentlySeekable()=0;
 	virtual RESULT seekChapter(int) { return -1; }
 	virtual RESULT seekTitle(int) { return -1; }
-		/* Position derived directly from the last decoded buffer's own PTS,
-		   rather than a hardware decoder-time register or pipeline position
-		   query (see getPlayPosition()) - not implemented by every service
-		   type, hence the default failure return here. */
-	virtual RESULT getPTSPlayPosition(pts_t &SWIG_OUTPUT) { return -1; }
 };
 SWIG_TEMPLATE_TYPEDEF(ePtr<iSeekableService>, iSeekableServicePtr);
 
