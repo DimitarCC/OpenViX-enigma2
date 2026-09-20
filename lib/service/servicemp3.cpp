@@ -1630,6 +1630,15 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 	m_position_baseline_valid = false;
 	m_position_correction_enabled = true;
 	m_position_baseline = 0;
+	m_position_baseline_stable_count = 0;
+	m_position_baseline_prev_raw = -1;
+	g_mutex_init(&m_pts_position_mutex);
+	m_last_audio_pts_ns = GST_CLOCK_TIME_NONE;
+	m_last_video_pts_ns = GST_CLOCK_TIME_NONE;
+	m_pts_audio_pad = NULL;
+	m_pts_video_pad = NULL;
+	m_pts_audio_probe_id = 0;
+	m_pts_video_probe_id = 0;
 	m_errorInfo.missing_codec = "";
 	audioSink = videoSink = NULL;
 	m_decoder = NULL;
@@ -1951,6 +1960,15 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 
 eServiceMP3::~eServiceMP3()
 {
+	/* Must happen before stop() hands the actual GST_STATE_NULL teardown off
+	 * to its worker thread (see stopWorker()'s comment) - once that worker
+	 * is running, the pipeline (and any pad ptsProbeCallback() reads from)
+	 * can keep delivering buffers into "this" for a while after this
+	 * destructor itself has finished, since the two are no longer
+	 * synchronized. Removing the probes here, synchronously, guarantees
+	 * ptsProbeCallback() can never fire into an already-freed "this". */
+	detachPTSProbes();
+
 	// disconnect subtitle callback
 	GstElement *subsink = gst_bin_get_by_name(GST_BIN(m_gst_playbin), "subtitle_sink");
 
@@ -2369,6 +2387,8 @@ RESULT eServiceMP3::stop()
 	 * startup correction for the next start() same as a fresh instance. */
 	m_position_baseline_valid = false;
 	m_position_correction_enabled = true;
+	m_position_baseline_stable_count = 0;
+	m_position_baseline_prev_raw = -1;
 	if (!m_gst_playbin || m_state == stStopped || !m_ref)
 		return -1;
 
@@ -2386,6 +2406,15 @@ RESULT eServiceMP3::stop()
 
 	stopHDAudioAuxPipeline(m_gst_playbin, false);
 	disconnectAsyncSignalHandlers();
+
+	/* Same reasoning as disconnectAsyncSignalHandlers()/the HDR probe
+	 * removal further below: once GST_STATE_NULL runs on stopWorker()'s
+	 * thread, this object can be destroyed (or restarted via start())
+	 * before that teardown actually completes, and ptsProbeCallback()
+	 * firing into a freed/reused "this" would be exactly the same class of
+	 * bug those exist to prevent. Remove synchronously, here, before
+	 * anything else. */
+	detachPTSProbes();
 
 	/* See stopWorker()'s comment: hand the actual (potentially blocking)
 	 * teardown off to a worker thread instead of doing it here, plus a
@@ -2771,12 +2800,24 @@ RESULT eServiceMP3::getRawPlayPosition(pts_t &pts)
  * manual seek reliably "fixes" the displayed position - not by making this
  * correction recompute itself, but because the sink itself starts reporting
  * correctly once a real seek has happened. So this correction only ever
- * applies once, before that first real seek: it captures a baseline against
- * the very first raw reading after start (assuming playback genuinely
- * starts at 0) and applies it until seekToImpl() runs for the first time,
- * at which point it is permanently disabled and getPlayPosition() reverts
- * to returning the (by then trustworthy) raw value unchanged - it must NOT
- * keep recomputing a new baseline after every seek.
+ * applies once, before that first real seek: it captures a baseline and
+ * applies it until seekToImpl() runs for the first time, at which point it
+ * is permanently disabled and getPlayPosition() reverts to returning the
+ * (by then trustworthy) raw value unchanged - it must NOT keep recomputing
+ * a new baseline after every seek.
+ *
+ * The baseline itself is not just latched onto the very first raw reading:
+ * network streams in particular can take a while to buffer/preroll, during
+ * which get-decoder-time/gst_element_query_position() may return a
+ * transient, unrepresentative value (e.g. stuck at 0, or some other
+ * not-yet-locked reading) before the decoder clock genuinely starts
+ * advancing - latching onto one of those would bake in a wrong baseline
+ * for the rest of this correction's lifetime. So, mirroring
+ * pushSubtitles()'s own "wait until clock is stable" guard, this instead
+ * waits to see the raw reading actually ADVANCE across several consecutive
+ * calls before trusting it, only then capturing it as the baseline. Until
+ * stabilised, this reports 0 rather than a baseline computed from an
+ * unstable reading.
  *
  * getRawPlayPosition() itself is left untouched - trickSeek()/
  * seekRelative()/clearBuffers() depend on its value being in the same
@@ -2797,9 +2838,29 @@ RESULT eServiceMP3::getPlayPosition(pts_t &pts)
 
 	if (!m_position_baseline_valid)
 	{
-		/* Very first reading after start: assume playback genuinely starts
-		 * at 0 and derive the baseline so that this first raw reading maps
-		 * to 0, not whatever raw value it is. */
+		/* Count consecutive calls where the raw reading has advanced from
+		 * the previous one; any repeat (still buffering/prerolling, or a
+		 * genuinely stuck clock) resets the count, same as
+		 * pushSubtitles()'s own stability guard. */
+		if (raw != m_position_baseline_prev_raw)
+			m_position_baseline_stable_count++;
+		else
+			m_position_baseline_stable_count = 0;
+		m_position_baseline_prev_raw = raw;
+
+		if (m_position_baseline_stable_count < 4)
+		{
+			pts = 0;
+			return 0;
+		}
+
+		/* Stabilised: the clock has been observed advancing on every one of
+		 * the last several calls, so this reading is trustworthy. Captures
+		 * "raw" as-is (the reading at the moment stabilisation was
+		 * confirmed, not the one from a few calls earlier when it started)
+		 * - the small amount of real playback time spent confirming
+		 * stability becomes a correspondingly small, one-time baseline
+		 * offset, not worth a rolling window to eliminate. */
 		m_position_baseline = raw;
 		m_position_baseline_valid = true;
 	}
@@ -2807,6 +2868,105 @@ RESULT eServiceMP3::getPlayPosition(pts_t &pts)
 	pts = raw - m_position_baseline;
 	if (pts < 0)
 		pts = 0;
+	return 0;
+}
+
+GstPadProbeReturn eServiceMP3::ptsProbeCallback(GstPad *pad, GstPadProbeInfo *info, gpointer user_data)
+{
+	eServiceMP3 *_this = (eServiceMP3*)user_data;
+	GstBuffer *buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+	if (!buffer)
+		return GST_PAD_PROBE_OK;
+
+	guint64 pts = GST_BUFFER_PTS(buffer);
+	if (!GST_CLOCK_TIME_IS_VALID(pts))
+		return GST_PAD_PROBE_OK;
+
+	g_mutex_lock(&_this->m_pts_position_mutex);
+	if (pad == _this->m_pts_audio_pad)
+		_this->m_last_audio_pts_ns = pts;
+	else if (pad == _this->m_pts_video_pad)
+		_this->m_last_video_pts_ns = pts;
+	g_mutex_unlock(&_this->m_pts_position_mutex);
+
+	return GST_PAD_PROBE_OK;
+}
+
+void eServiceMP3::attachPTSProbes()
+{
+	/* Re-resolve every time this runs (READY_TO_PAUSED, alongside
+	 * audioSink/videoSink themselves being re-resolved) rather than only
+	 * once: audioSink/videoSink can be replaced across a pipeline restart,
+	 * and a stale pad reference here would silently stop updating. */
+	detachPTSProbes();
+
+	if (audioSink)
+	{
+		GstPad *pad = gst_element_get_static_pad(audioSink, "sink");
+		if (pad)
+		{
+			m_pts_audio_pad = pad; /* takes the ref from get_static_pad */
+			m_pts_audio_probe_id = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
+				ptsProbeCallback, this, NULL);
+		}
+	}
+	if (videoSink)
+	{
+		GstPad *pad = gst_element_get_static_pad(videoSink, "sink");
+		if (pad)
+		{
+			m_pts_video_pad = pad;
+			m_pts_video_probe_id = gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER,
+				ptsProbeCallback, this, NULL);
+		}
+	}
+}
+
+void eServiceMP3::detachPTSProbes()
+{
+	if (m_pts_audio_pad)
+	{
+		if (m_pts_audio_probe_id)
+			gst_pad_remove_probe(m_pts_audio_pad, m_pts_audio_probe_id);
+		gst_object_unref(m_pts_audio_pad);
+		m_pts_audio_pad = NULL;
+		m_pts_audio_probe_id = 0;
+	}
+	if (m_pts_video_pad)
+	{
+		if (m_pts_video_probe_id)
+			gst_pad_remove_probe(m_pts_video_pad, m_pts_video_probe_id);
+		gst_object_unref(m_pts_video_pad);
+		m_pts_video_pad = NULL;
+		m_pts_video_probe_id = 0;
+	}
+	g_mutex_lock(&m_pts_position_mutex);
+	m_last_audio_pts_ns = GST_CLOCK_TIME_NONE;
+	m_last_video_pts_ns = GST_CLOCK_TIME_NONE;
+	g_mutex_unlock(&m_pts_position_mutex);
+}
+
+/* Position derived directly from the last decoded buffer's own
+ * GST_BUFFER_PTS (read via ptsProbeCallback() on the audio/video sink
+ * pads) - the same mechanism pullSubtitle() already uses for subtitle
+ * buffers, applied here for a general playback position instead of
+ * getRawPlayPosition()'s hardware decoder-time register / pipeline
+ * position query. Prefers audio's PTS over video's, same preference
+ * getRawPlayPosition() already has, for consistency between the two. */
+RESULT eServiceMP3::getPTSPlayPosition(pts_t &pts)
+{
+	pts = 0;
+
+	g_mutex_lock(&m_pts_position_mutex);
+	guint64 pts_ns = GST_CLOCK_TIME_IS_VALID(m_last_audio_pts_ns) ?
+		m_last_audio_pts_ns : m_last_video_pts_ns;
+	g_mutex_unlock(&m_pts_position_mutex);
+
+	if (!GST_CLOCK_TIME_IS_VALID(pts_ns))
+		return -1;
+
+	/* pts_ns is in nanoseconds. we have 90 000 pts per second. */
+	pts = pts_ns / 11111LL;
 	return 0;
 }
 
@@ -4090,33 +4250,49 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 					if (subsink)
 					{
 						/*
+						 * FIX: Seems that subtitle sink have a delay of receiving subtitles buffer.
+						 * So we move ahead the PTS of the subtitle sink by 2 seconds.
+						 * Then we do aditional sync of subtitles if they arrive ahead of PTS
+						 */
+						g_object_set (G_OBJECT (subsink), "ts-offset", -2LL * GST_SECOND, NULL);
+						/*
 						 * gstreamer suffers from a bug causing sparse streams (like
 						 * embedded subtitle tracks, which can go a long time between
-						 * buffers) to stall pipeline preroll and any later flushing
-						 * seek: a sync=TRUE sink won't report PAUSED until it has a
-						 * buffer to preroll on, and both preroll and a flushing seek
-						 * wait for every sink to reach that state - so if the seek
-						 * target has no subtitle buffer anywhere nearby, the whole
-						 * seek can hang forever waiting on this one sink.
+						 * buffers) to stall pipeline preroll: a sync=TRUE sink won't
+						 * report PAUSED until it has a buffer to preroll on, and a
+						 * flushing seek waits for every sink to reach that state - so
+						 * if the seek target has no subtitle buffer anywhere nearby,
+						 * the whole seek can hang forever waiting on this one sink.
 						 * see: https://bugzilla.gnome.org/show_bug.cgi?id=619434
-						 * async=TRUE alone does not prevent this in practice (seeks
-						 * still hang on-device with only that set) - it only affects
-						 * the state-change preroll handshake, not whatever a flushing
-						 * seek additionally waits for. sync=FALSE takes this sink off
-						 * the pipeline clock entirely, so it never blocks on a nearby
-						 * buffer at all: safe here because display timing is not
-						 * driven by the sink's own clock-gated rendering - it's fully
-						 * decoupled already, computed by pullSubtitle()/
-						 * pushSubtitles() from GST_BUFFER_PTS() vs getRawPlayPosition()
-						 * and displayed via m_subtitle_sync_timer regardless of when
-						 * "new-buffer" itself fires. ts-offset (previously set here to
-						 * compensate for sync=TRUE's clock wait) is meaningless once
-						 * there is no clock wait left to offset, so it's dropped. */
-						g_object_set (G_OBJECT (subsink), "sync", FALSE, NULL);
+						 * async=TRUE (unlike sync=FALSE, tried previously) only takes
+						 * this sink out of the preroll handshake - buffers it does
+						 * receive are still clock-gated/timed normally via sync=TRUE,
+						 * so display timing (ts-offset/pushSubtitles()'s own PTS
+						 * comparison) is unaffected. */
 						g_object_set (G_OBJECT (subsink), "async", TRUE, NULL);
+						{
+							/* Read back what GStreamer actually stored: if "subsink"
+							 * doesn't implement GstBaseSink's standard async property
+							 * the way assumed, g_object_set() above silently no-ops
+							 * (GLib only warns, never errors, on an unknown/wrong-type
+							 * property) and this readback will not show TRUE. */
+							gboolean async_readback = FALSE;
+							g_object_get(G_OBJECT(subsink), "async", &async_readback, NULL);
+							eDebug("[eServiceMP3] subsink async property readback: %s", async_readback ? "TRUE" : "FALSE");
+						}
 						eDebug("[eServiceMP3] subsink properties set!");
 						gst_object_unref(subsink);
 					}
+					/* Must happen before audioSink/videoSink themselves are
+					 * unreffed just below: detachPTSProbes() removes the
+					 * probe from their current sink pads, which requires
+					 * those pads (and the elements owning them) to still be
+					 * valid. attachPTSProbes() (further down) re-adds probes
+					 * on whatever audioSink/videoSink are resolved to this
+					 * time, so this is a full detach-then-reattach cycle
+					 * across every pipeline (re)start, same as audioSink/
+					 * videoSink's own re-resolution here. */
+					detachPTSProbes();
 					if (audioSink)
 					{
 						gst_object_unref(GST_OBJECT(audioSink));
@@ -4141,6 +4317,8 @@ void eServiceMP3::gstBusCall(GstMessage *msg)
 						g_value_unset(&result);
 					}
 					gst_iterator_free(children);
+
+					attachPTSProbes();
 
 					/* if we are in preroll already do not check again the state */
 					if (!m_is_live)

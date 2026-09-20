@@ -177,6 +177,7 @@ public:
 	RESULT getPlayPosition(pts_t &SWIG_OUTPUT);
 	RESULT setTrickmode(int trick);
 	RESULT isCurrentlySeekable();
+	RESULT getPTSPlayPosition(pts_t &SWIG_OUTPUT);
 
 		// iServiceInformation
 	RESULT getName(std::string &name);
@@ -385,6 +386,36 @@ private:
 	bool m_position_baseline_valid;
 	bool m_position_correction_enabled;
 	pts_t m_position_baseline;
+	/* Used by getPlayPosition() to avoid capturing m_position_baseline from
+	 * a transient/unrepresentative raw reading seen before the decoder
+	 * clock has actually locked onto real playback - especially likely on
+	 * network streams, which take longer to buffer/preroll than local
+	 * files, so there is more opportunity for an early, spurious reading to
+	 * be mistaken for the real starting offset. This mirrors
+	 * pushSubtitles()'s own "wait until clock is stable" guard
+	 * (m_decoder_time_valid_state/m_prev_decoder_time) but is kept
+	 * separate: same technique, unrelated purpose, and reusing that pair
+	 * would cross-talk between the two. */
+	int m_position_baseline_stable_count;
+	pts_t m_position_baseline_prev_raw;
+
+	/* getPTSPlayPosition(): position derived directly from the last decoded
+	 * buffer's own GST_BUFFER_PTS, read via pad probes on the audio/video
+	 * sink pads - same mechanism pullSubtitle() already uses for subtitle
+	 * buffers, applied here for a general playback position instead. This
+	 * is intentionally independent of getRawPlayPosition()/getPlayPosition()
+	 * (hardware decoder-time register / pipeline position query) - a
+	 * separate, additive way to read position, not a replacement. */
+	GMutex m_pts_position_mutex;
+	guint64 m_last_audio_pts_ns; /* GST_CLOCK_TIME_NONE if none seen yet */
+	guint64 m_last_video_pts_ns;
+	GstPad *m_pts_audio_pad;
+	GstPad *m_pts_video_pad;
+	gulong m_pts_audio_probe_id;
+	gulong m_pts_video_probe_id;
+	void attachPTSProbes();
+	void detachPTSProbes();
+	static GstPadProbeReturn ptsProbeCallback(GstPad *pad, GstPadProbeInfo *info, gpointer user_data);
 
 	void pushDVBSubtitles();
 	void pushSubtitles();
