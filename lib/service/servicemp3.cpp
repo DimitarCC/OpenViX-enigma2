@@ -2838,20 +2838,25 @@ RESULT eServiceMP3::getPlayPosition(pts_t &pts)
 
 	if (!m_position_baseline_valid)
 	{
-		/* Count consecutive calls where the raw reading has advanced from
-		 * the previous one; anything that is not a strict increase (still
-		 * buffering/prerolling, a genuinely stuck clock, or a noisy/
+		/* Count consecutive calls where the raw reading has not gone
+		 * backwards from the previous one; a drop (still buffering/
+		 * prerolling, a genuinely stuck-then-reset clock, or a noisy/
 		 * non-monotonic reading bouncing between values while prerolling)
-		 * resets the count. Deliberately stricter than a plain "!=" check:
+		 * resets the count. Deliberately >= rather than a plain "!=" check:
 		 * get-decoder-time/gst_element_query_position() can jitter
 		 * non-monotonically before the decoder clock genuinely locks (e.g.
 		 * 0, 5, 0, 3, ...), and unlike pushSubtitles()'s per-call use of its
 		 * own stability guard (which just gates whether to trust *that
 		 * call's* reading, recomputed fresh every time), a bad reading
 		 * captured here becomes a permanent baseline for the rest of the
-		 * session - so a value that merely differs from the last one is not
-		 * enough evidence it is trustworthy. */
-		if (raw > m_position_baseline_prev_raw)
+		 * session - so a value merely differing from the last one is not
+		 * enough evidence it is trustworthy. Not strict ">" either: this is
+		 * polled independently by several UI timers (position display,
+		 * subtitle renderer, timeshift, ...), all sharing this same
+		 * counter, so two back-to-back calls legitimately landing on the
+		 * same not-yet-updated raw reading is normal and must not be
+		 * treated the same as an actual jitter-induced drop. */
+		if (raw >= m_position_baseline_prev_raw)
 			m_position_baseline_stable_count++;
 		else
 			m_position_baseline_stable_count = 0;
