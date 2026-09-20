@@ -1896,15 +1896,6 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 		guint flags = GST_PLAY_FLAG_AUDIO | GST_PLAY_FLAG_VIDEO | \
 				GST_PLAY_FLAG_TEXT | GST_PLAY_FLAG_NATIVE_VIDEO;
 
-		/* Connected unconditionally (not just for streaming/download-buffer
-		 * sources, as before): handleElementAdded() also needs to see
-		 * "input-selector" - playbin's internal element for arbitrating
-		 * between multiple text (subtitle) pads - which is created for
-		 * local file playback too whenever a file has more than one
-		 * embedded subtitle track. Its other branches (queue2/decodebin
-		 * handling) already no-op safely when not relevant. */
-		g_signal_connect(G_OBJECT(m_gst_playbin), "element-added", G_CALLBACK(handleElementAdded), this);
-
 		if ( m_sourceinfo.is_streaming )
 		{
 			g_signal_connect (G_OBJECT (m_gst_playbin), "notify::source", G_CALLBACK (playbinNotifySource), this);
@@ -1912,6 +1903,7 @@ eServiceMP3::eServiceMP3(eServiceReference ref):
 			{
 				/* use progressive download buffering */
 				flags |= GST_PLAY_FLAG_DOWNLOAD;
+				g_signal_connect(G_OBJECT(m_gst_playbin), "element-added", G_CALLBACK(handleElementAdded), this);
 				/* limit file size */
 				g_object_set(m_gst_playbin, "ring-buffer-max-size", (guint64)(8LL * 1024LL * 1024LL), NULL);
 			}
@@ -5106,32 +5098,6 @@ void eServiceMP3::handleElementAdded(GstBin *bin, GstElement *element, gpointer 
 			 * Ignore other bins since they may have unrelated queues
 			 */
 				g_signal_connect(element, "element-added", G_CALLBACK(handleElementAdded), user_data);
-		}
-		else if (g_str_has_prefix(elementname, "input-selector"))
-		{
-			/* playbin creates its own internal GstInputSelector to arbitrate
-			 * between multiple text (subtitle) pads when a stream has more
-			 * than one - this file has two embedded SRT/ASS tracks, so this
-			 * fires for the text selector. With sync-streams (default TRUE),
-			 * selecting/seeking requires every input pad - not just the
-			 * active one - to stay roughly time-synchronized; a sparse,
-			 * currently-UNSELECTED subtitle pad that can't keep up can then
-			 * stall a flushing seek on the whole pipeline even though
-			 * subsink (the currently-active pad's sink) is never itself
-			 * blocked - this is a different mechanism than the sync=FALSE/
-			 * async=TRUE mitigations on subsink, which only affect the
-			 * active pad's own sink. Disabling sync-streams only affects
-			 * how the INACTIVE pad is kept in step for a seamless later
-			 * switch - it does not touch the timing of buffers from
-			 * whichever pad is currently selected, which pullSubtitle()/
-			 * pushSubtitles() already time from the buffer's own PTS
-			 * regardless. */
-			g_object_set(G_OBJECT(element), "sync-streams", FALSE, NULL);
-			{
-				gboolean sync_streams_readback = TRUE;
-				g_object_get(G_OBJECT(element), "sync-streams", &sync_streams_readback, NULL);
-				eDebug("[eServiceMP3] %s sync-streams property readback: %s", elementname, sync_streams_readback ? "TRUE" : "FALSE");
-			}
 		}
 		g_free(elementname);
 	}
